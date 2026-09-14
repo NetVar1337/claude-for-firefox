@@ -92,15 +92,10 @@ find_firefox() {
             fi
             ;;
         linux)
-            if command -v firefox &>/dev/null; then
-                FIREFOX_BIN="$(command -v firefox)"
-                info "Found Firefox: $FIREFOX_BIN"
-            elif [[ -x /usr/bin/firefox ]]; then
-                FIREFOX_BIN="/usr/bin/firefox"
-                info "Found Firefox at /usr/bin/firefox"
-            else
-                die "Firefox not found. Install Firefox first."
-            fi
+            # Any Gecko browser works (Zen, LibreWolf, ...); FIREFOX_BIN overrides.
+            FIREFOX_BIN="${FIREFOX_BIN:-$(command -v firefox || command -v zen-browser || command -v zen || command -v librewolf || true)}"
+            [[ -x "$FIREFOX_BIN" ]] || die "Firefox (or Gecko fork) not found. Install one or set FIREFOX_BIN."
+            info "Found browser: $FIREFOX_BIN"
             ;;
     esac
 }
@@ -116,6 +111,8 @@ inject_tokens() {
             ;;
         linux)
             raw_creds="$(secret-tool lookup service 'Claude Code-credentials' 2>/dev/null || true)"
+            # Claude Code on Linux usually stores credentials in a file, not the keyring
+            [[ -z "$raw_creds" && -f "$HOME/.claude/.credentials.json" ]] && raw_creds="$(<"$HOME/.claude/.credentials.json")"
             ;;
     esac
 
@@ -214,6 +211,11 @@ install_nmh_manifests() {
 }
 NMHEOF
         ok "NMH manifest installed: $manifest_path"
+        # ponytail: Zen keeps its data in ~/.zen; mirror there in case it looks locally
+        if [[ "$OS" == linux && -d "$HOME/.zen" ]]; then
+            mkdir -p "$HOME/.zen/native-messaging-hosts"
+            cp "$manifest_path" "$HOME/.zen/native-messaging-hosts/"
+        fi
     done
 }
 
@@ -240,7 +242,7 @@ case "$(uname -s)" in
         [[ ! -x "$FIREFOX" ]] && FIREFOX="$HOME/Applications/Firefox.app/Contents/MacOS/firefox"
         ;;
     Linux)
-        FIREFOX="$(command -v firefox 2>/dev/null || echo /usr/bin/firefox)"
+        FIREFOX="${FIREFOX_BIN:-__FIREFOX_BIN__}"
         ;;
 esac
 
@@ -249,9 +251,11 @@ if [[ ! -x "${FIREFOX:-}" ]]; then
     exit 1
 fi
 
-echo "Launching Firefox with Claude extension..."
-exec "$FIREFOX" --new-instance --profile "$(mktemp -d)" "$@" &
+echo "Launching $FIREFOX with Claude extension..."
+# web-ext loads the unsigned extension as a temporary add-on in a fresh profile
+exec npx --yes web-ext run --firefox="$FIREFOX" --source-dir="$EXT_DIR" "$@"
 LAUNCHEOF
+    if [[ "$OS" == linux ]]; then sed -i "s|__FIREFOX_BIN__|$FIREFOX_BIN|" "$INSTALL_DIR/launch.sh"; fi
     chmod +x "$INSTALL_DIR/launch.sh"
     ok "Launcher created at $INSTALL_DIR/launch.sh"
 }
@@ -273,6 +277,7 @@ case "$(uname -s)" in
         ;;
     Linux)
         raw_creds="$(secret-tool lookup service 'Claude Code-credentials' 2>/dev/null || true)"
+        [[ -z "$raw_creds" && -f "$HOME/.claude/.credentials.json" ]] && raw_creds="$(<"$HOME/.claude/.credentials.json")"
         ;;
     *)
         echo "Unsupported OS for token refresh." >&2; exit 1 ;;
@@ -377,11 +382,12 @@ do_uninstall() {
 
     # Remove NMH manifests
     for nmh_name in "$NMH_NAME_BROWSER" "$NMH_NAME_CODE"; do
-        local mf="$NMH_DIR/$nmh_name.json"
-        if [[ -f "$mf" ]]; then
-            rm -f "$mf"
-            ok "Removed NMH manifest: $mf"
-        fi
+        for mf in "$NMH_DIR/$nmh_name.json" "$HOME/.zen/native-messaging-hosts/$nmh_name.json"; do
+            if [[ -f "$mf" ]]; then
+                rm -f "$mf"
+                ok "Removed NMH manifest: $mf"
+            fi
+        done
     done
 
     # Remove install dir
