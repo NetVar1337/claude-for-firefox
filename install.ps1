@@ -209,6 +209,12 @@ public class CredHelper {
         }
     }
 
+    # Fallback: credentials file written by Claude Code on Windows
+    if (-not $rawCreds) {
+        $credFile = Join-Path $env:USERPROFILE '.claude\.credentials.json'
+        if (Test-Path $credFile) { $rawCreds = Get-Content $credFile -Raw }
+    }
+
     if (-not $rawCreds) {
         Write-Warn "Could not read Claude Code credentials from Windows Credential Manager."
         Write-Warn "Run 'claude' at least once to log in, then re-run this installer."
@@ -240,34 +246,23 @@ public class CredHelper {
 function Create-NmhWrapper {
     Write-Banner 'Creating Native Host Wrapper'
 
+    $nodeCmd = Get-Command node -ErrorAction SilentlyContinue
+    if (-not $nodeCmd) { Exit-Fatal 'Node.js 18+ not found. Install it first.' }
+    $NodeBin = $nodeCmd.Source
+    foreach ($script in 'firefox-host.mjs', 'firefox-mcp.mjs') {
+        Copy-Item -Path (Join-Path $PSScriptRoot "native\$script") -Destination $InstallDir -Force
+    }
+    Write-Ok "Native host and MCP server copied to $InstallDir"
+
+
     $wrapperPath = Join-Path $InstallDir 'firefox-native-host.bat'
-    $wrapperContent = @'
+    $wrapperContent = @"
 @echo off
 REM Native messaging host wrapper for Claude for Firefox.
-REM Delegates to Claude Code's built-in native messaging handler.
-
-if defined CLAUDE_CODE_BIN (
-    if exist "%CLAUDE_CODE_BIN%" (
-        "%CLAUDE_CODE_BIN%" --chrome-native-host
-        exit /b %ERRORLEVEL%
-    )
-)
-
-where claude.exe >nul 2>&1
-if %ERRORLEVEL% equ 0 (
-    claude.exe --chrome-native-host
-    exit /b %ERRORLEVEL%
-)
-
-set "CANDIDATE=%LOCALAPPDATA%\Programs\claude-code\claude.exe"
-if exist "%CANDIDATE%" (
-    "%CANDIDATE%" --chrome-native-host
-    exit /b %ERRORLEVEL%
-)
-
-echo {"error":"claude binary not found"} >&2
-exit /b 1
-'@
+REM Runs the bundled host, which serves its own pipe so it can run next to Claude for Chrome.
+"$NodeBin" "$InstallDir\firefox-host.mjs" 2>>"%~dp0host.log"
+exit /b %ERRORLEVEL%
+"@
     Set-Content -Path $wrapperPath -Value $wrapperContent -Encoding ASCII
     Write-Ok "Native host wrapper created at $wrapperPath"
     return $wrapperPath
@@ -318,7 +313,7 @@ if not exist "%EXT_DIR%" (
     exit /b 1
 )
 echo Launching Firefox with Claude extension...
-start "" "$FirefoxPath" --new-instance
+start "" /b cmd /c npx --yes web-ext run --source-dir "%EXT_DIR%" --firefox "$FirefoxPath" --firefox-profile "%USERPROFILE%\.claude\firefox\profile" --profile-create-if-missing --keep-profile-changes --start-url about:blank --pref=browser.startup.homepage_override.mstone=ignore --pref=startup.homepage_welcome_url= --pref=startup.homepage_welcome_url.additional= --pref=browser.aboutwelcome.enabled=false --pref=browser.shell.checkDefaultBrowser=false --pref=datareporting.policy.dataSubmissionPolicyBypassNotification=true --pref=browser.startup.page=0 --pref=trailhead.firstrun.didSeeAboutWelcome=true --no-reload
 "@
     Set-Content -Path $batPath -Value $batContent -Encoding ASCII
     Write-Ok "Launcher .bat created at $batPath"
@@ -333,7 +328,7 @@ if (-not (Test-Path `$extDir)) {
     exit 1
 }
 Write-Host 'Launching Firefox with Claude extension...'
-Start-Process '$FirefoxPath' -ArgumentList '--new-instance'
+& npx --yes web-ext run --source-dir `$extDir --firefox '$FirefoxPath' --firefox-profile (Join-Path `$env:USERPROFILE '.claude\firefox\profile') --profile-create-if-missing --keep-profile-changes --start-url about:blank '--pref=browser.startup.homepage_override.mstone=ignore' '--pref=startup.homepage_welcome_url=' '--pref=startup.homepage_welcome_url.additional=' '--pref=browser.aboutwelcome.enabled=false' '--pref=browser.shell.checkDefaultBrowser=false' '--pref=datareporting.policy.dataSubmissionPolicyBypassNotification=true' '--pref=browser.startup.page=0' '--pref=trailhead.firstrun.didSeeAboutWelcome=true' --no-reload
 "@
     Set-Content -Path $ps1Path -Value $ps1Content -Encoding UTF8
     Write-Ok "Launcher .ps1 created at $ps1Path"
@@ -393,6 +388,11 @@ public class CredHelper2 {
 }
 
 if (-not $rawCreds) {
+    $credFile = Join-Path $env:USERPROFILE '.claude\.credentials.json'
+    if (Test-Path $credFile) { $rawCreds = Get-Content $credFile -Raw }
+}
+
+if (-not $rawCreds) {
     Write-Error "No Claude Code credentials found. Log in with 'claude' first."
     exit 1
 }
@@ -435,6 +435,9 @@ function Do-Uninstall {
         Remove-Item -Path $parentKey -Force -ErrorAction SilentlyContinue
     }
 
+    # Remove MCP registration
+    try { & claude mcp remove firefox --scope user 2>$null | Out-Null } catch {}
+
     # Remove install directory
     if (Test-Path $InstallDir) {
         Remove-Item -Path $InstallDir -Recurse -Force
@@ -462,20 +465,26 @@ function Main {
     Write-Ok "Extension directory: $ExtDir"
 
     # Copy extension files if available
-    $scriptDir = Split-Path -Parent $MyInvocation.ScriptName
-    $srcExtDir = Join-Path $scriptDir 'extension'
-    if (Test-Path $srcExtDir) {
-        Copy-Item -Path "$srcExtDir\*" -Destination $ExtDir -Recurse -Force
-        Write-Ok "Extension files copied to $ExtDir"
-    } else {
-        Write-Warn "No extension\ directory found next to installer. Skipping file copy."
-        Write-Warn "Place extension source files in $ExtDir manually."
+    $srcExtDir = $PSScriptRoot
+    $exclude = @('.git','.gm','.agentplug-kv','node_modules','web-ext-artifacts','install.ps1','install.sh','native','README.md','.gitignore')
+    Get-ChildItem -Path $srcExtDir -Force | Where-Object { $exclude -notcontains $_.Name -and $_.Name -ne 'firefox-injected-tokens.json' } | ForEach-Object {
+        Copy-Item -Path $_.FullName -Destination $ExtDir -Recurse -Force
     }
+    Write-Ok "Extension files copied to $ExtDir"
 
     $wrapperPath = Create-NmhWrapper
     Install-NmhManifests -WrapperPath $wrapperPath
     Inject-Tokens
     Create-Launchers -FirefoxPath $firefoxBin
+
+    Write-Banner 'Registering Firefox MCP server'
+    $mcpList = & $claudeBin mcp list 2>$null | Out-String
+    if ($mcpList -match '(?m)^firefox:') {
+        Write-Ok 'Claude Code already has the firefox MCP server.'
+    } else {
+        & $claudeBin mcp add firefox --scope user -- node (Join-Path $InstallDir 'firefox-mcp.mjs') | Out-Null
+        Write-Ok 'Registered firefox MCP server with Claude Code (user scope).'
+    }
 
     # ── Summary ─────────────────────────────────────────────────────────
     Write-Banner 'Installation Complete'

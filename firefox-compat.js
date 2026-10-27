@@ -184,7 +184,40 @@
     onMoved: makeEvent(),
   };
 
+  // Firefox rejects about:newtab / chrome://newtab as an explicit URL; omitting it opens the default new tab
+  const NEWTAB_URL = /^(about:newtab\/?|chrome:\/\/newtab\/?)$/;
+  function withoutNewtabUrl(info) {
+    if (!info || typeof info.url !== 'string' || !NEWTAB_URL.test(info.url)) return info;
+    const { url, ...rest } = info;
+    return rest;
+  }
+  const nativeTabsCreate = browser.tabs.create.bind(browser.tabs);
+  // The extension opens an OAuth login tab on every (temporary) install; the installer already bootstraps tokens from Claude Code
+  const OAUTH_LOGIN_URL = /^https:\/\/claude\.ai\/(login|oauth\/authorize)/;
+  async function hasUsableTokens() {
+    const stored = await browser.storage.local.get(['accessToken']);
+    if (stored.accessToken) return true;
+    try {
+      const file = await (await fetch(chrome.runtime.getURL('firefox-injected-tokens.json'))).json();
+      return Boolean(file.accessToken);
+    } catch (_) {
+      return false;
+    }
+  }
+  chrome.tabs.create = promiseToCallback(async function (info) {
+    if (info && typeof info.url === 'string' && OAUTH_LOGIN_URL.test(info.url) && await hasUsableTokens()) {
+      return { id: browser.tabs.TAB_ID_NONE, windowId: browser.windows.WINDOW_ID_NONE, index: -1, active: false, url: 'about:blank' };
+    }
+    return nativeTabsCreate(withoutNewtabUrl(info));
+  });
+  const nativeWindowsCreate = browser.windows.create.bind(browser.windows);
+  chrome.windows.create = promiseToCallback(async function (info) {
+    return nativeWindowsCreate(withoutNewtabUrl(info));
+  });
+
   // Patch chrome.tabs.group
+  const nativeTabsGet = browser.tabs.get.bind(browser.tabs);
+  const nativeTabsQuery = browser.tabs.query.bind(browser.tabs);
   const origTabsGroup = chrome.tabs.group;
   chrome.tabs.group = promiseToCallback(async function (options) {
     await loadGroupCache();
@@ -194,7 +227,7 @@
       let windowId = -1;
       if (tabIds.length > 0) {
         try {
-          const t = await browser.tabs.get(tabIds[0]);
+          const t = await nativeTabsGet(tabIds[0]);
           windowId = t.windowId;
         } catch (_) { /* fallback */ }
       }
@@ -231,21 +264,19 @@
   });
 
   // Patch chrome.tabs.get to include groupId
-  const origTabsGet = chrome.tabs.get.bind(chrome.tabs);
   chrome.tabs.get = promiseToCallback(async function (tabId) {
-    const tab = await browser.tabs.get(tabId);
+    const tab = await nativeTabsGet(tabId);
     await loadGroupCache();
     tab.groupId = tabGroupMap.get(tabId) ?? TAB_GROUP_ID_NONE;
     return tab;
   });
 
   // Patch chrome.tabs.query to include groupId and support groupId filter
-  const origTabsQuery = chrome.tabs.query.bind(chrome.tabs);
   chrome.tabs.query = promiseToCallback(async function (queryInfo) {
     const filterGroupId = queryInfo ? queryInfo.groupId : undefined;
     const cleanQuery = { ...queryInfo };
     delete cleanQuery.groupId;
-    const tabs = await browser.tabs.query(cleanQuery);
+    const tabs = await nativeTabsQuery(cleanQuery);
     await loadGroupCache();
     for (const tab of tabs) {
       tab.groupId = tabGroupMap.get(tab.id) ?? TAB_GROUP_ID_NONE;
@@ -347,6 +378,86 @@
     };
   }
 
+  // Page-side implementations of the CDP Input domain, run through scripting.executeScript
+  async function pageInput(tabId, func, params) {
+    const [injected] = await browser.scripting.executeScript({ target: { tabId }, func, args: [params || {}] });
+    return injected && injected.result;
+  }
+
+  function dispatchMouseInPage(p) {
+    const el = document.elementFromPoint(p.x, p.y) || document.body;
+    const button = p.button === 'right' ? 2 : p.button === 'middle' ? 1 : 0;
+    const init = {
+      bubbles: true, cancelable: true, composed: true, view: window,
+      clientX: p.x, clientY: p.y, button, buttons: p.buttons || 0, detail: p.clickCount || 0,
+      ctrlKey: !!(p.modifiers & 2), shiftKey: !!(p.modifiers & 8), altKey: !!(p.modifiers & 1), metaKey: !!(p.modifiers & 4),
+    };
+    const fire = (type, Ctor = MouseEvent) => el.dispatchEvent(new Ctor(type, init));
+    if (p.type === 'mouseMoved') {
+      fire('pointermove', PointerEvent); fire('mousemove');
+    } else if (p.type === 'mousePressed') {
+      fire('pointerdown', PointerEvent); fire('mousedown');
+      const focusable = el.closest('a[href],button,input,select,textarea,summary,[tabindex],[contenteditable]');
+      if (focusable && focusable.focus) focusable.focus();
+    } else if (p.type === 'mouseReleased') {
+      fire('pointerup', PointerEvent); fire('mouseup');
+      if (button === 2) fire('contextmenu');
+      else {
+        fire('click');
+        if (p.clickCount === 2) fire('dblclick');
+      }
+    } else if (p.type === 'mouseWheel') {
+      el.dispatchEvent(new WheelEvent('wheel', { ...init, deltaX: p.deltaX || 0, deltaY: p.deltaY || 0 }));
+      window.scrollBy(p.deltaX || 0, p.deltaY || 0);
+    }
+  }
+
+  function insertTextInPage(p) {
+    const el = document.activeElement;
+    if (!el) return;
+    if (el.isContentEditable) {
+      document.execCommand('insertText', false, p.text);
+    } else if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
+      const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+      const start = el.selectionStart == null ? el.value.length : el.selectionStart;
+      const end = el.selectionEnd == null ? el.value.length : el.selectionEnd;
+      setter.call(el, el.value.slice(0, start) + p.text + el.value.slice(end));
+      el.setSelectionRange && el.setSelectionRange(start + p.text.length, start + p.text.length);
+      el.dispatchEvent(new InputEvent('input', { bubbles: true, data: p.text, inputType: 'insertText' }));
+    }
+  }
+
+  function dispatchKeyInPage(p) {
+    const el = document.activeElement || document.body;
+    const init = {
+      bubbles: true, cancelable: true, composed: true, key: p.key, code: p.code,
+      ctrlKey: !!(p.modifiers & 2), shiftKey: !!(p.modifiers & 8), altKey: !!(p.modifiers & 1), metaKey: !!(p.modifiers & 4),
+    };
+    const type = p.type === 'keyUp' ? 'keyup' : p.type === 'char' ? 'keypress' : 'keydown';
+    const proceed = el.dispatchEvent(new KeyboardEvent(type, init));
+    if (!proceed || p.type === 'keyUp') return;
+    const editable = el.isContentEditable || el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement;
+    if (p.text && p.type !== 'rawKeyDown' && editable && !(p.modifiers & 6)) {
+      insertTextInPage({ text: p.text });
+    } else if (p.key === 'Backspace' && editable) {
+      if (el.isContentEditable) document.execCommand('delete');
+      else {
+        const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+        const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+        const start = el.selectionStart, end = el.selectionEnd;
+        const from = start === end ? Math.max(0, start - 1) : start;
+        setter.call(el, el.value.slice(0, from) + el.value.slice(end));
+        el.setSelectionRange(from, from);
+        el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteContentBackward' }));
+      }
+    } else if (p.key === 'Enter' && p.type !== 'rawKeyDown') {
+      if (el instanceof HTMLTextAreaElement || el.isContentEditable) insertTextInPage({ text: '\n' });
+      else if (el instanceof HTMLInputElement && el.form) el.form.requestSubmit();
+      else if (el instanceof HTMLButtonElement || el instanceof HTMLAnchorElement) el.click();
+    }
+  }
+
   // ─── 5. chrome.debugger shim ──────────────────────────────────────
   if (typeof chrome.debugger === 'undefined') {
     const debuggerSessions = new Map(); // tabId → true
@@ -377,26 +488,47 @@
         if (method === 'Runtime.evaluate') {
           const expr = commandParams && commandParams.expression;
           if (!expr) return { result: { type: 'undefined' } };
-          try {
-            const results = await browser.scripting.executeScript({
-              target: { tabId },
-              func: new Function('return (' + expr + ')'),
-              world: 'MAIN',
-            });
-            const value = results && results[0] && results[0].result;
+          const evaluate = async (source) => {
+            try {
+              const value = await (0, eval)(source);
+              return { value };
+            } catch (e) {
+              return { error: String((e && e.stack) || e) };
+            }
+          };
+          let injected;
+          for (const world of ['MAIN', 'ISOLATED']) {
+            try {
+              injected = await browser.scripting.executeScript({ target: { tabId }, func: evaluate, args: [expr], world });
+              if (!injected[0].result.error || world === 'ISOLATED') break;
+            } catch (e) {
+              injected = [{ result: { error: e.message } }];
+            }
+          }
+          const outcome = injected[0].result;
+          if (outcome.error) {
             return {
-              result: {
-                type: typeof value,
-                value,
-                description: String(value),
-              },
-            };
-          } catch (e) {
-            return {
-              result: { type: 'object', subtype: 'error', description: e.message },
-              exceptionDetails: { text: e.message },
+              result: { type: 'object', subtype: 'error', description: outcome.error },
+              exceptionDetails: { text: outcome.error, exception: { description: outcome.error } },
             };
           }
+          const value = outcome.value;
+          return { result: { type: value === null ? 'object' : typeof value, value, description: String(value) } };
+        }
+
+        if (method === 'Input.dispatchMouseEvent') {
+          await pageInput(tabId, dispatchMouseInPage, commandParams);
+          return {};
+        }
+
+        if (method === 'Input.dispatchKeyEvent') {
+          await pageInput(tabId, dispatchKeyInPage, commandParams);
+          return {};
+        }
+
+        if (method === 'Input.insertText') {
+          await pageInput(tabId, insertTextInPage, commandParams);
+          return {};
         }
 
         if (method === 'Page.captureScreenshot') {
@@ -504,6 +636,21 @@
       getMatchedRules: promiseToCallback(async () => ({ rulesMatchedInfo: [] })),
       onRuleMatchedDebug: makeEvent(),
     };
+  }
+
+  // ─── 7. Origin header for api.anthropic.com ───────────────────────
+  // Anthropic answers 401 "CORS requests are not allowed for this Organization" to a moz-extension:// Origin
+  const dnrNative = browser.declarativeNetRequest;
+  if (dnrNative && dnrNative.updateSessionRules) {
+    dnrNative.updateSessionRules({
+      removeRuleIds: [9001],
+      addRules: [{
+        id: 9001,
+        priority: 1,
+        action: { type: 'modifyHeaders', requestHeaders: [{ header: 'origin', operation: 'remove' }] },
+        condition: { urlFilter: '||api.anthropic.com/', resourceTypes: ['xmlhttprequest'] },
+      }],
+    }).catch(e => console.warn(TAG, 'origin header rule failed', e));
   }
 
   // ─── Init log ─────────────────────────────────────────────────────

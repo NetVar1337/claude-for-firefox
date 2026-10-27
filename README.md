@@ -238,3 +238,13 @@ When submitting a pull request:
 Extension assets are from Anthropic's [Claude browser extension](https://claude.com/claude-for-chrome) (v1.0.70). The Firefox compatibility layer, installers, and native messaging host setup are community-contributed under the MIT license.
 
 This is an unofficial community project and is not affiliated with or endorsed by Anthropic.
+
+---
+
+## Running alongside Claude for Chrome
+
+Claude Code's built-in `claude --chrome-native-host` listens on one fixed pipe per user, so a second browser cannot share it, and the claude.ai bridge rejects the `moz-extension://` origin. The installer therefore bundles its own native host (`native/firefox-host.mjs`, own pipe `claude-firefox-bridge-<user>`) and an MCP server (`native/firefox-mcp.mjs`) that it registers with Claude Code as `firefox`.
+
+Chrome keeps using the `claude-in-chrome` tools; Firefox is driven with `mcp__firefox__*` tools (`tabs_context_mcp`, `navigate`, `computer`, `read_page`, `find`, `get_page_text`, `javascript_tool`, ...) which take the same arguments. Both can be used in the same session.
+
+The Firefox host logs to `~/.claude/firefox/host.log`.
