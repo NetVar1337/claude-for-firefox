@@ -88,10 +88,21 @@ function Find-Claude {
 
 # ── Find Firefox ────────────────────────────────────────────────────────────
 function Find-Firefox {
-    # Standard paths
+    # Env var override
+    if ($env:FIREFOX_BIN -and (Test-Path $env:FIREFOX_BIN)) {
+        Write-Info "Using FIREFOX_BIN override: $($env:FIREFOX_BIN)"
+        return $env:FIREFOX_BIN
+    }
+
+    # Standard paths (release, then Nightly / Developer Edition)
     $candidates = @(
         "${env:ProgramFiles}\Mozilla Firefox\firefox.exe",
-        "${env:ProgramFiles(x86)}\Mozilla Firefox\firefox.exe"
+        "${env:ProgramFiles(x86)}\Mozilla Firefox\firefox.exe",
+        "${env:ProgramFiles}\Firefox Nightly\firefox.exe",
+        "${env:ProgramFiles(x86)}\Firefox Nightly\firefox.exe",
+        "${env:LOCALAPPDATA}\Firefox Nightly\firefox.exe",
+        "${env:ProgramFiles}\Firefox Developer Edition\firefox.exe",
+        "${env:ProgramFiles(x86)}\Firefox Developer Edition\firefox.exe"
     )
 
     foreach ($c in $candidates) {
