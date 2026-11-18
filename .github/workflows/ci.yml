@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Validate manifest.json
+        run: |
+          node -e '
+            const fs = require("fs");
+            const m = JSON.parse(fs.readFileSync("manifest.json", "utf8"));
+            if (m.manifest_version !== 3) throw new Error("Expected MV3");
+            if (!m.name || !m.version) throw new Error("Missing name/version");
+            console.log("Valid manifest:", m.name, m.version);
+          '
+
+      - name: Check JS syntax
+        run: |
+          for f in *.js; do
+            echo "Checking $f"
+            node --check "$f"
+          done
