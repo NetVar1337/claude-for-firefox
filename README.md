@@ -63,6 +63,12 @@ cd claude-for-firefox
 powershell -ExecutionPolicy Bypass -File install.ps1
 ```
 
+If Node.js is not in `PATH` (a portable Node.js, or a version manager such as nvm-windows, fnm or
+Volta), pass its `node.exe` with `-NodePath C:\path\to\node.exe` or set `NODE_BIN`. The native host,
+the MCP server and the launchers then run it by its full path. Windows user names with letters
+outside ASCII (Cyrillic or Chinese, say) work: the generated `.bat` files name paths in the profile
+as `%USERPROFILE%\...`.
+
 The installer handles everything:
 
 1. Copies extension files to `~/.claude/firefox/extension/`
