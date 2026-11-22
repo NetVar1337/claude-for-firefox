@@ -32,7 +32,7 @@
     // Set the sidebar panel URL with the tabId parameter so the panel
     // knows which tab context it belongs to.
     if (sidebarApi.setPanel) {
-      var panelUrl = chrome.runtime.getURL('side-panel.html');
+      var panelUrl = chrome.runtime.getURL('sidepanel.html');
       if (tabId) {
         panelUrl += '?tabId=' + encodeURIComponent(tabId);
       }
