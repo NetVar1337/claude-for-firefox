@@ -8,13 +8,18 @@
     and creates launcher scripts.
 .PARAMETER Uninstall
     Remove all installed components.
+.PARAMETER NodePath
+    node.exe (Node.js 18 or later) for the native host and the MCP server, when
+    Node.js is not in PATH (the environment variable NODE_BIN works too).
 .EXAMPLE
     .\install.ps1
+    .\install.ps1 -NodePath C:\tools\node\node.exe
     .\install.ps1 -Uninstall
 #>
 [CmdletBinding()]
 param(
-    [switch]$Uninstall
+    [switch]$Uninstall,
+    [string]$NodePath
 )
 
 Set-StrictMode -Version Latest
@@ -34,12 +39,52 @@ function Write-Info  { param([string]$Msg) Write-Host "[INFO]  $Msg" -Foreground
 function Write-Ok    { param([string]$Msg) Write-Host "[OK]    $Msg" -ForegroundColor Green }
 function Write-Warn  { param([string]$Msg) Write-Host "[WARN]  $Msg" -ForegroundColor Yellow }
 function Write-Err   { param([string]$Msg) Write-Host "[ERROR] $Msg" -ForegroundColor Red }
-function Write-Banner { param([string]$Msg) Write-Host "`n── $Msg ──`n" -ForegroundColor White }
+function Write-Banner { param([string]$Msg) Write-Host "`n-- $Msg --`n" -ForegroundColor White }
 
 function Exit-Fatal {
     param([string]$Msg)
     Write-Err $Msg
     exit 1
+}
+
+# Runs a program and returns its output, stderr included, as text. Windows PowerShell 5.1 turns
+# a native program's stderr into a terminating error while $ErrorActionPreference is 'Stop'.
+function Invoke-Native {
+    param([string]$Exe, [string[]]$Arguments)
+    $old = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $out = & $Exe @Arguments 2>&1 | ForEach-Object { "$_" } | Out-String
+    } finally {
+        $ErrorActionPreference = $old
+    }
+    return $out
+}
+
+# Files that other programs parse are written without a byte order mark: Windows
+# PowerShell 5.1's "-Encoding UTF8" adds one.
+function Write-Utf8NoBom {
+    param([string]$Path, [string]$Content)
+    [System.IO.File]::WriteAllText($Path, $Content, (New-Object System.Text.UTF8Encoding($false)))
+}
+
+# cmd.exe reads a .bat file in the OEM code page, so a path with letters outside ASCII (a
+# Cyrillic or Chinese user name, say) breaks in a file written as ASCII. A path in the user's
+# profile is written as %USERPROFILE%\..., which cmd expands at run time; the file is written in
+# the OEM code page, with CRLF line ends, for any other path.
+function ConvertTo-BatPath {
+    param([string]$Path)
+    $profileDir = $env:USERPROFILE.TrimEnd('\')
+    if ($Path.StartsWith($profileDir + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+        return '%USERPROFILE%' + $Path.Substring($profileDir.Length)
+    }
+    return $Path
+}
+
+function Write-BatFile {
+    param([string]$Path, [string]$Content)
+    $oem = [System.Text.Encoding]::GetEncoding([System.Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage)
+    [System.IO.File]::WriteAllText($Path, ($Content -replace "`r?`n", "`r`n"), $oem)
 }
 
 # ── Find Claude Code ────────────────────────────────────────────────────────
@@ -139,6 +184,37 @@ function Find-Firefox {
     Exit-Fatal "Firefox not found. Install Firefox first."
 }
 
+# ── Find Node.js ────────────────────────────────────────────────────────────
+function Find-Node {
+    $candidates = @()
+    foreach ($explicit in @($NodePath, $env:NODE_BIN)) {
+        if ($explicit) {
+            if (-not (Test-Path -LiteralPath $explicit -PathType Leaf)) {
+                Exit-Fatal "node.exe not found at: $explicit"
+            }
+            $candidates += (Resolve-Path -LiteralPath $explicit).Path
+            break
+        }
+    }
+    if ($candidates.Count -eq 0) {
+        $cmd = Get-Command node -ErrorAction SilentlyContinue
+        if ($cmd) { $candidates += $cmd.Source }
+        $candidates += (Join-Path $env:ProgramFiles 'nodejs\node.exe')
+    }
+
+    foreach ($c in $candidates) {
+        if (-not (Test-Path -LiteralPath $c -PathType Leaf)) { continue }
+        $version = (Invoke-Native -Exe $c -Arguments @('--version')).Trim()
+        if ($version -match '^v(\d+)\.' -and [int]$Matches[1] -ge 18) {
+            Write-Info "Using Node.js $version at: $c"
+            return $c
+        }
+        Write-Warn "Skipping $c (version '$version'; Node.js 18 or later is needed)."
+    }
+
+    Exit-Fatal 'Node.js 18+ not found. Install it, or pass -NodePath <path to node.exe>.'
+}
+
 # ── Inject OAuth Tokens ────────────────────────────────────────────────────
 function Inject-Tokens {
     Write-Banner 'Injecting OAuth Tokens'
@@ -235,7 +311,7 @@ public class CredHelper {
             refreshToken = $oauth.refreshToken
             expiresAt    = $oauth.expiresAt
         }
-        $tokenObj | ConvertTo-Json | Set-Content -Path $tokenFile -Encoding UTF8
+        Write-Utf8NoBom -Path $tokenFile -Content ($tokenObj | ConvertTo-Json)
         Write-Ok "OAuth tokens injected."
     } catch {
         Write-Warn "Failed to parse OAuth tokens: $_"
@@ -244,26 +320,27 @@ public class CredHelper {
 
 # ── Create Native Host Wrapper ──────────────────────────────────────────────
 function Create-NmhWrapper {
+    param([string]$NodeBin)
+
     Write-Banner 'Creating Native Host Wrapper'
 
-    $nodeCmd = Get-Command node -ErrorAction SilentlyContinue
-    if (-not $nodeCmd) { Exit-Fatal 'Node.js 18+ not found. Install it first.' }
-    $NodeBin = $nodeCmd.Source
     foreach ($script in 'firefox-host.mjs', 'firefox-mcp.mjs') {
         Copy-Item -Path (Join-Path $PSScriptRoot "native\$script") -Destination $InstallDir -Force
     }
     Write-Ok "Native host and MCP server copied to $InstallDir"
 
-
+    # The host script is found next to the wrapper (%~dp0), so no path in the file has to survive
+    # the OEM code page.
     $wrapperPath = Join-Path $InstallDir 'firefox-native-host.bat'
+    $batNode = ConvertTo-BatPath $NodeBin
     $wrapperContent = @"
 @echo off
 REM Native messaging host wrapper for Claude for Firefox.
 REM Runs the bundled host, which serves its own pipe so it can run next to Claude for Chrome.
-"$NodeBin" "$InstallDir\firefox-host.mjs" 2>>"%~dp0host.log"
+"$batNode" "%~dp0firefox-host.mjs" 2>>"%~dp0host.log"
 exit /b %ERRORLEVEL%
 "@
-    Set-Content -Path $wrapperPath -Value $wrapperContent -Encoding ASCII
+    Write-BatFile -Path $wrapperPath -Content $wrapperContent
     Write-Ok "Native host wrapper created at $wrapperPath"
     return $wrapperPath
 }
@@ -285,7 +362,7 @@ function Install-NmhManifests {
             type               = 'stdio'
             allowed_extensions = @($ExtId)
         }
-        $manifest | ConvertTo-Json -Depth 5 | Set-Content -Path $manifestPath -Encoding UTF8
+        Write-Utf8NoBom -Path $manifestPath -Content ($manifest | ConvertTo-Json -Depth 5)
         Write-Ok "NMH manifest written: $manifestPath"
 
         # Create registry key pointing to the manifest
@@ -298,30 +375,38 @@ function Install-NmhManifests {
 
 # ── Create Launcher Scripts ────────────────────────────────────────────────
 function Create-Launchers {
-    param([string]$FirefoxPath)
+    param([string]$FirefoxPath, [string]$NodeBin)
 
     Write-Banner 'Creating Launcher Scripts'
 
+    # npx comes with Node.js; the launchers put Node's folder first in PATH, so a Node.js that is
+    # not in PATH works too.
+    $nodeDir = Split-Path -Parent $NodeBin
+
     # .bat launcher
     $batPath = Join-Path $InstallDir 'launch.bat'
+    $batFirefox = ConvertTo-BatPath $FirefoxPath
+    $batNodeDir = ConvertTo-BatPath $nodeDir
     $batContent = @"
 @echo off
 REM Launch Firefox with Claude extension.
 set "EXT_DIR=%USERPROFILE%\.claude\firefox\extension"
+set "PATH=$batNodeDir;%PATH%"
 if not exist "%EXT_DIR%" (
     echo Error: Extension not installed at %EXT_DIR%. Run install.ps1 first. >&2
     exit /b 1
 )
 echo Launching Firefox with Claude extension...
-start "" /b cmd /c npx --yes web-ext run --source-dir "%EXT_DIR%" --firefox "$FirefoxPath" --firefox-profile "%USERPROFILE%\.claude\firefox\profile" --profile-create-if-missing --keep-profile-changes --start-url about:blank --pref=browser.startup.homepage_override.mstone=ignore --pref=startup.homepage_welcome_url= --pref=startup.homepage_welcome_url.additional= --pref=browser.aboutwelcome.enabled=false --pref=browser.shell.checkDefaultBrowser=false --pref=datareporting.policy.dataSubmissionPolicyBypassNotification=true --pref=browser.startup.page=0 --pref=trailhead.firstrun.didSeeAboutWelcome=true --no-reload
+start "" /b cmd /c npx --yes web-ext run --source-dir "%EXT_DIR%" --firefox "$batFirefox" --firefox-profile "%USERPROFILE%\.claude\firefox\profile" --profile-create-if-missing --keep-profile-changes --start-url about:blank --pref=browser.startup.homepage_override.mstone=ignore --pref=startup.homepage_welcome_url= --pref=startup.homepage_welcome_url.additional= --pref=browser.aboutwelcome.enabled=false --pref=browser.shell.checkDefaultBrowser=false --pref=datareporting.policy.dataSubmissionPolicyBypassNotification=true --pref=browser.startup.page=0 --pref=trailhead.firstrun.didSeeAboutWelcome=true --no-reload
 "@
-    Set-Content -Path $batPath -Value $batContent -Encoding ASCII
+    Write-BatFile -Path $batPath -Content $batContent
     Write-Ok "Launcher .bat created at $batPath"
 
-    # .ps1 launcher
+    # .ps1 launcher (written with a byte order mark, so Windows PowerShell 5.1 reads any path in it)
     $ps1Path = Join-Path $InstallDir 'launch.ps1'
     $ps1Content = @"
 # Launch Firefox with Claude extension.
+`$env:PATH = '$nodeDir;' + `$env:PATH
 `$extDir = Join-Path `$env:USERPROFILE '.claude\firefox\extension'
 if (-not (Test-Path `$extDir)) {
     Write-Error "Extension not installed at `$extDir. Run install.ps1 first."
@@ -450,7 +535,7 @@ function Do-Uninstall {
 
 # ── Main ────────────────────────────────────────────────────────────────────
 function Main {
-    Write-Banner 'Claude for Firefox — Windows Installer'
+    Write-Banner 'Claude for Firefox - Windows Installer'
 
     if ($Uninstall) {
         Do-Uninstall
@@ -459,6 +544,7 @@ function Main {
 
     $claudeBin  = Find-Claude
     $firefoxBin = Find-Firefox
+    $nodeBin    = Find-Node
 
     # Create directories
     New-Item -ItemType Directory -Force -Path $ExtDir | Out-Null
@@ -472,18 +558,24 @@ function Main {
     }
     Write-Ok "Extension files copied to $ExtDir"
 
-    $wrapperPath = Create-NmhWrapper
+    $wrapperPath = Create-NmhWrapper -NodeBin $nodeBin
     Install-NmhManifests -WrapperPath $wrapperPath
     Inject-Tokens
-    Create-Launchers -FirefoxPath $firefoxBin
+    Create-Launchers -FirefoxPath $firefoxBin -NodeBin $nodeBin
 
     Write-Banner 'Registering Firefox MCP server'
-    $mcpList = & $claudeBin mcp list 2>$null | Out-String
+    # Registered with the full path of node.exe, so Claude Code starts it even when Node.js is not
+    # in PATH. An earlier registration (perhaps with a bare "node") is replaced.
+    $mcpScript = Join-Path $InstallDir 'firefox-mcp.mjs'
+    $mcpList = Invoke-Native -Exe $claudeBin -Arguments @('mcp', 'list')
     if ($mcpList -match '(?m)^firefox:') {
-        Write-Ok 'Claude Code already has the firefox MCP server.'
-    } else {
-        & $claudeBin mcp add firefox --scope user -- node (Join-Path $InstallDir 'firefox-mcp.mjs') | Out-Null
+        Invoke-Native -Exe $claudeBin -Arguments @('mcp', 'remove', 'firefox', '--scope', 'user') | Out-Null
+    }
+    $addOut = Invoke-Native -Exe $claudeBin -Arguments @('mcp', 'add', 'firefox', '--scope', 'user', '--', $nodeBin, $mcpScript)
+    if ($LASTEXITCODE -eq 0) {
         Write-Ok 'Registered firefox MCP server with Claude Code (user scope).'
+    } else {
+        Write-Warn "Could not register the firefox MCP server: $($addOut.Trim())"
     }
 
     # ── Summary ─────────────────────────────────────────────────────────
@@ -495,6 +587,7 @@ function Main {
     Write-Host "NMH manifests:  $NmhDir"
     Write-Host "Claude binary:  $claudeBin"
     Write-Host "Firefox binary: $firefoxBin"
+    Write-Host "Node.js:        $nodeBin"
     Write-Host ''
     Write-Host 'Next steps:' -ForegroundColor Yellow
     Write-Host "  1. Open Firefox and go to about:debugging#/runtime/this-firefox"
